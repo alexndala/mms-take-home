@@ -50,4 +50,25 @@ follow/unfollow and edit history are correct but not hot.
 
 **Exit criteria:** every figure used later is defined here. Met the requrement.
 
+## Phase 3 — Freeze the API contract (before any frontend code)
+
+**Goal:** make the contract the single source of truth the frontend compiles against.
+
+- **3.1** Endpoints for publish, timeline, post, edit, revisions, search, follow, unfollow, delete, media.
+- **3.2** Shared `Post` / `Revision` schemas (the types the frontend imports).
+- **3.3** AuthN/Z: 15-min JWT + rotating refresh + `jti` denylist.
+- **3.4** **Keyset cursor** `base64url(created_at_ms ":" post_id)`, strict watermark; new posts
+  appear on refresh, never injected mid-page.
+- **3.5** Idempotency: `Idempotency-Key` on publish; edit guarded by `If-Match: revision`.
+- **3.6** Error model: `{ error: { code, message, retryable, request_id, details } }`; never 200 on a failed write.
+
+**Decision D3 — cursor, not offset.**
+New posts shift offsets, so offset pagination duplicates and skips items mid-scroll.
+- *Trade-off:* clients cannot jump to "page N" and must replay from the head to refresh. Accepted;
+  for a live feed, correctness beats random access.
+**Decision D3b — `If-Match` revision on edit.**
+- *Trade-off:* one extra round trip on conflict (`412`); in return, concurrent edits cannot silently clobber.
+
+**Exit criteria:** the contract is complete enough to hand to the frontend without further design. Met the requirements.
+
 ---
