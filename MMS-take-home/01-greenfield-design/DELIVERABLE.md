@@ -386,3 +386,227 @@ hiding) then physically purges Timeline Store entries, posts, revisions, search 
 objects within 24h. Scales by sharding deletion jobs. Unavailable/failed halfway: jobs are
 resumable and idempotent; read-time filtering already hides the content, so the deadline is the only
 residual risk.
+
+
+## 5. API contract
+
+Base URL `https://api.chirp.example/v1`. JSON request and response bodies. All authenticated calls
+carry `Authorization: Bearer <access_token>`. Times are RFC 3339 UTC. Identifiers are opaque
+strings (`u_…`, `p_…`, `m_…`) — Snowflake-backed but not parsed by clients.
+
+### 5.1 Endpoints
+
+**Publish a post**
+
+```
+POST /posts
+Headers: Authorization, Idempotency-Key: <uuid>, Content-Type: application/json
+Body:    { "body": "string, 1..500 chars", "media_id": "m_…" | null }
+201 ->   Post
+```
+Status codes: `201` created · `400` malformed JSON · `401` missing/expired token · `403`
+suspended account · `409` idempotency key reused with a different body · `413` body over 500 chars
+or media over 2 MB · `422` referenced media not uploaded/valid · `429` rate limited · `503`
+publish path shedding.
+
+**Read home timeline**
+
+```
+GET /timelines/home?limit=20&cursor=<opaque>
+200 -> { "items": [Post], "next_cursor": "string" | null, "generated_at": "…" }
+```
+`limit` default 20, max 50. `cursor` absent means "head" (newest). Status: `200` · `400` bad
+cursor/limit · `401` · `429`.
+
+**Read a single post**
+
+```
+GET /posts/{post_id}
+200 -> Post
+```
+`404` unknown or author-deleted · `410` purged and gone permanently · `401` · `429`.
+
+**Edit a post (inside the 15 minute window)**
+
+```
+PATCH /posts/{post_id}
+Headers: Authorization, If-Match: <revision>
+Body:    { "body": "string, 1..500 chars" }
+200 ->   Post   (revision incremented, "edited": true, "edited_at" set)
+```
+Status: `200` · `403` not the author · `404` · `409` edit window closed (past published_at + 15 min)
+· `412` `If-Match` revision is stale (someone edited first) · `413`/`422` invalid body · `429`.
+
+**Read a post's edit history**
+
+```
+GET /posts/{post_id}/revisions?limit=20&cursor=<opaque>
+200 -> { "items": [Revision], "next_cursor": "string" | null }
+```
+Revisions returned newest-first. Status: `200` · `404` · `401` · `429`.
+
+**Search the public corpus**
+
+```
+GET /search?q=<query>&limit=20&cursor=<opaque>&sort=recent
+200 -> { "items": [Post], "next_cursor": "string" | null, "took_ms": 12 }
+```
+`q` required (1..200 chars after trim). `sort` defaults to `recent` precisely so the 5 s freshness
+SLO is observable; `relevance` is allowed but ranked search is otherwise out of scope. Status: `200`
+· `400` missing/empty `q` · `401` · `429`.
+
+**Follow / unfollow**
+
+```
+POST   /follows/{user_id}     204   (idempotent: following an already-followed account is 204)
+DELETE /follows/{user_id}     204   (idempotent)
+```
+Status: `204` · `403` self-follow/blocked · `404` unknown user · `401` · `429`.
+
+**Delete an account**
+
+```
+DELETE /accounts/me
+202 -> { "deletion_id": "d_…", "purge_deadline": "…Z", "received_at": "…Z" }
+```
+Asynchronous. `purge_deadline` is `received_at + 24h` and is the SLO promise. Status: `202` ·
+`401` · `429`.
+
+**Media upload (two-step, because the image can exceed any sane request body and must not transit
+the API tier)**
+
+```
+POST /media
+Body: { "content_type": "image/jpeg", "size_bytes": 1572864 }
+201 ->{ "media_id": "m_…", "upload_url": "https://…presigned…", "expires_at": "…Z" }
+POST /media/{media_id}/complete
+202 ->{ "media_id": "m_…", "status": "processing" | "ready" | "blocked" }
+```
+`POST /media` rejects a non-allowlisted content type or `size_bytes > 2_097_152` with `422`/`413`.
+The client `PUT`s bytes to `upload_url` out of band. Publish may reference a `media_id` that is
+`processing`; the post's `media.status` then transitions to `ready` (or `blocked`) asynchronously.
+
+**Shared object schemas** (these are the types the frontend compiles against):
+
+```jsonc
+// Post
+{
+  "post_id":   "p_01JBCHIRP0000000000000001",
+  "author": {
+    "user_id":      "u_01JBCHIRP0000000000000009",
+    "handle":       "ada",
+    "display_name": "Ada L.",
+    "avatar_url":   "https://cdn.chirp.example/avatars/u_…/thumb.jpg"
+  },
+  "body":       "hello, timeline",
+  "created_at": "2026-10-10T21:00:00Z",
+  "edited":     true,
+  "edited_at":  "2026-10-10T21:10:00Z",
+  "revision":   2,
+  "media": {
+    "media_id":  "m_01JBCHIRP0000000000000007",
+    "type":      "image",
+    "status":    "ready",
+    "thumb_url":  "https://cdn.chirp.example/m/…/thumb.jpg",
+    "medium_url": "https://cdn.chirp.example/m/…/medium.jpg",
+    "full_url":   "https://cdn.chirp.example/m/…/full.jpg",
+    "width":  1200,
+    "height": 800
+  },
+  "permalink": "https://chirp.example/p/p_01JBCHIRP0000000000000001"
+}
+
+// Revision
+{
+  "revision":  1,
+  "body":      "hello, timelines",
+  "editor_id": "u_01JBCHIRP0000000000000009",
+  "edited_at": "2026-10-10T21:10:00Z"
+}
+```
+
+`media` is `null` when the post has no image. `edited` is `false` and `edited_at` is `null` on an
+unedited post; `revision` starts at `1` on publish and increments per edit.
+
+### 5.2 Authentication and authorisation
+
+- **Scheme:** OAuth 2.1 / OIDC. Access token is a JWT (RS256), lifetime **15 minutes**, claims
+  `sub` (user_id), `scope`, `exp`, `jti`.
+- **Where the credential lives:** `Authorization: Bearer` header, never a query parameter or a
+  cookie. The browser frontend holds the access token in memory only; the refresh token is an
+  opaque, rotating, server-stored value (httpOnly cookie on the web app).
+- **Refresh:** opaque refresh token, 30 day idle lifetime, rotated on every use; reuse of a rotated
+  token invalidates the family.
+- **Revocation:** the 15 minute access TTL bounds the worst case, but account deletion and
+  "log out everywhere" need to be immediate, so the `jti` is added to a Redis denylist for the
+  remainder of its life. Refresh-family deletion is the primary revocation; the denylist closes the
+  short window.
+- **Authorisation:** edit requires `sub == post.author_id` **and** `now <= published_at + 15 min`;
+  account deletion only for `self`; rate limits keyed on `sub`.
+
+### 5.3 Pagination
+
+**Mechanism: opaque keyset cursor**, `base64url(created_at_epoch_ms ":" post_id)`. Sort is
+`(created_at DESC, post_id DESC)`, so the cursor is a total order key with no ties.
+
+**Why not offset:** the home timeline is a merge of continuously appended streams. With
+`OFFSET`, a single new post at the head shifts every subsequent offset, so page 2 can repeat an item
+from page 1 and silently drop another. Keyset cursors are immune because they are anchored to a
+value, not a count. Relevance-sorted search uses the same envelope but carries the backend's sort
+key in the cursor.
+
+**New posts arriving mid-page:** they are **not injected** into an in-flight sequence. Page N+1
+returns only items strictly older than the cursor, so a single scroll never duplicates or skips an
+item. New posts are surfaced by a fresh head request (no cursor) and rendered as a "show N new
+posts" affordance, which resets pagination to the new head.
+
+### 5.4 Idempotency
+
+| Operation | Idempotent? | Mechanism |
+|-----------|-------------|-----------|
+| Publish | No (would duplicate) | Client `Idempotency-Key` (UUIDv4). Server stores `key -> post_id` for 24h; a replay returns the original `201` and `Post`. Same key + different body → `409`. |
+| Edit | No (append semantics) | Guarded by `If-Match: <revision>`. Safe retry: same revision + same content → `200`; same revision after it moved → `412`. |
+| Follow / Unfollow | Yes (state convergence) | Last-writer-wins on the graph edge; always `204`. |
+| Delete account | Yes | Replay returns the same `deletion_id` and `202`. |
+| Media complete | Yes | Completing an already-complete media returns the same status. |
+
+**Safe retry of a publish:** client generates the key once per user intent, retries the identical
+request with exponential backoff on `429`/`5xx`, and never generates a new key for the same logical
+post. If the client lost the response, the replay returns the created post; the client reconciles by
+`post_id` and does not create a second post.
+
+### 5.5 Error model
+
+Single shape, always non-2xx on failure:
+
+```json
+{
+  "error": {
+    "code": "EDIT_WINDOW_CLOSED",
+    "message": "This post can no longer be edited.",
+    "retryable": false,
+    "request_id": "req_4f2a…",
+    "details": { "post_id": "p_01J…", "editable_until": "2026-10-10T21:15:00Z" }
+  }
+}
+```
+
+| Status | Meaning in Chirp | Retryable |
+|--------|------------------|-----------|
+| 400 | malformed request / bad cursor | No |
+| 401 | token missing, expired or revoked | No (refresh, then retry once) |
+| 403 | authenticated but not permitted (not author, suspended) | No |
+| 404 | resource unknown, or author-deleted | No |
+| 409 | state conflict (edit window closed, idempotency mismatch) | No |
+| 410 | post purged permanently | No |
+| 412 | `If-Match` precondition failed (stale revision) | No (re-fetch, then decide) |
+| 413 | payload too large | No |
+| 422 | semantically invalid (media not ready, bad content type) | No |
+| 429 | rate limited | **Yes** (honour `Retry-After`) |
+| 500 / 502 / 503 / 504 | server-side; `503` also signals publish shedding | **Yes** (bounded backoff) |
+
+`retryable` is set by the server and is authoritative; the frontend must render from `error.code`
+and `error.message`, not from a status-code guess. A failed write **never** returns `200`.
+
+**The frontend in `frontend/` implements exactly this contract**, including the error shape and the
+cursor envelope.
