@@ -27,26 +27,57 @@ Fill this in at the end. Wall-clock hours, honestly.
 
 ---
 
-## Entries
-
-### Example entry, delete me
-
-**Saturday, about 09:20.** Read the Problem 1 prompt twice. First reaction: the deletion
-requirement is the hard one, not the fanout. I want to check that before I commit to a shape.
-
-**Saturday, about 09:50.** Worked the fanout arithmetic on paper. The average and the skew figure
-do not sit together the way I first read them. Wrote down the reading I am adopting and moved on.
-
-**Saturday, about 11:30. Dead end.** Spent 40 minutes on a design that rewrites every timeline
-entry when a post is edited. Abandoned it. At the edit volume the prompt implies, the rewrite cost
-is larger than the whole write path. Storing post identifiers in the timeline removes the problem
-entirely. Kept the second approach.
-
 ---
 
 ### Your entries start here
 
+#### Phase 0 - Frame the problem
 
+**Saturday, about 09:20** Read the prompt twice. I will have to tabulate the fanout figures tomorrow: "average fanout 50" next to "top 0.1% each exceed 1M followers". Before drawing anything.
+
+### Phase 1 - Scope and assumptions
+
+**Saturday, about 10:00.** Ordered use cases by load, not by feature - timeline read and publish first. Wrote down every number the prompt left open (peak x3, 15% image posts, 1.5 MB originals, 800-entry timeline retention, 5% edit incidence, 100k deletions/month). An assumption I do not write down is one I cannot defend later.
+
+
+**Phase 2 — Capacity. Saturday, about 10:30.** Worked writes (`579/s`, peak `1,737/s`) and fanout
+(`29k/s`, `87k/s`), then the skew burst (one post `>=1M` writes, `231k-579k/s`). **Change of mind:**
+I first wrote a single read:write ratio of ~100:1 out of 'acceptability/ standard' reasons; a page read hydrates 20 posts, so
+the request ratio hides a ~20x larger content load that actually drives CDN cost. Split into
+**~10:1 requests / ~160:1 content**, each cross-checked against per-user behaviour.
+
+**Phase 3 — Freeze the contract. Sunday, about 10:39.** Wrote the endpoints, then the type
+schemas, because the frontend compiles against these. Chose a **keyset cursor** over offset. Put
+`Idempotency-Key` on publish and `If-Match: revision` on edit. **Dead end:** I sketched offset paging
+first because it is less code; abandoned it once I traced what a post landing mid-scroll does.
+
+**Phase 4 — Architecture and components. Sunday, about 11:13.** Drew the diagram only after the
+arithmetic settled DR-1. Event-driven fanout off a Kafka topic, shared with the search indexer (one
+event, two idempotent consumers). Moderation hook between ingest and fanout so a verdict can
+suppress fanout without changing the API.
+
+**Phase 5 — Data model. Sunday, about 20:00.** Chose partition keys from access patterns: `Post`
+by `post_id`, timeline by `viewer_id`, `PostRevision` by `post_id`. Two non-obvious pieces: an
+**author-keyed celebrity list** (a celebrity delete becomes a single-partition op) and a
+`fanout_recipients` **reverse index** (purge can answer "who received this post"). **Change of
+mind:** I first tried to make purge scan the timeline table; at ~16B steady-state rows across viewer
+partitions that is unscannable. The reverse index roughly **doubles ordinary fanout writes**;
+accepted as the price of a real 24h purge.
+
+**Phase 6 — Decision records. Sunday, about 21:37.** Wrote the five records in the exact template.
+The discipline that mattered: each "numbers that forced it" had to cite a specific figure, or the
+record scores zero. For DR-2 the forcing case is the worked-trace author — a 3M-follower edit would
+be 3M rewrites if the body were denormalised.
+
+**Phase 7 — Non-functionals. Sunday, about 22:21.** Bottlenecks in saturation order (fanout
+>100k/s, then read/cache, then search lag), the six failure cases with the user-visible effect,
+consistency per read path, security, and SLOs (timeline p99 < 200 ms, search <= 5 s, purge <= 24 h).
+
+**Phase 8 — Worked trace. Sunday, about 23:14.** Traced the 3M-follower edit during pagination.
+**Dead end:** my first draft used a pushed, denormalised author and the trace collapsed into
+"rewrite 3M rows", which is not the design; rewrote it around a **pulled** celebrity where the edit
+touches zero timeline rows. Computed the cursor token with a script so it actually decodes to the
+stated key. Conclusion: the follower sees the post **once, possibly stale — never twice, never zero.**
 
 ---
 
