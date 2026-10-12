@@ -97,3 +97,19 @@ export async function parseError(response: Response): Promise<ApiError> {
 
   return new ApiError(info, response.status)
 }
+
+/** Normalise anything thrown in a `catch` into an `ApiError` so the UI always has the model. */
+export function asApiError(error: unknown): ApiError {
+  if (error instanceof ApiError) {
+    return error
+  }
+  return new ApiError(
+    {
+      code: 'UNKNOWN_ERROR',
+      message: 'Something went wrong. Please try again.',
+      retryable: false,
+      request_id: 'client',
+    },
+    0,
+  )
+}
