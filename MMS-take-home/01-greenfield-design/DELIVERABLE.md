@@ -610,3 +610,119 @@ and `error.message`, not from a status-code guess. A failed write **never** retu
 
 **The frontend in `frontend/` implements exactly this contract**, including the error shape and the
 cursor envelope.
+
+## 6. Data model
+
+Keys are chosen from the access patterns in section 5, not from normal form. Every table states its
+partition key and why the hot read or write lands on a single partition.
+
+### 6.1 Post (Post + Revision Store, wide-column)
+
+| Field | Notes |
+|-------|-------|
+| `post_id` | **partition key**, Snowflake, time-ordered |
+| `author_id` | secondary (materialised) index for profile listing and purge |
+| `body` | current body, ≤ 500 chars |
+| `created_at` | publish time; the cursor sort key |
+| `revision` | current revision number, starts at 1 |
+| `edited` / `edited_at` | null until first edit |
+| `media_id` | null, or FK to Media |
+| `state` | `live` or `tombstoned` |
+
+**Partition by `post_id`.** The dominant access is point hydration by `post_id` (timeline and search
+both return ids that are then batched). Time-ordered ids mean range scans by `post_id` are also
+roughly range scans by time. Listing a user's posts is served by the `author_id` index, which is a
+secondary path and is used by purge, not by the hot read.
+
+### 6.2 PostRevision (full snapshots)
+
+| Field | Notes |
+|-------|-------|
+| `post_id` | **partition key** |
+| `revision` | **clustering key**, DESC |
+| `body`, `editor_id`, `edited_at` | snapshot of that revision |
+
+**Partition by `post_id`, cluster by `revision`.** Reading edit history is "all revisions for one
+post, newest first". Full snapshots (not deltas) because section 2.5 shows history is ~45 GB/month —
+delta-chain reconstruction would buy nothing and complicate the read. The 15 minute window plus an
+edit rate limit bounds the partition.
+
+### 6.3 Timeline entry (materialised push timeline, ScyllaDB)
+
+| Field | Notes |
+|-------|-------|
+| `viewer_id` | **partition key** |
+| `created_at` | **clustering key**, DESC |
+| `post_id` | **clustering key**, DESC (tiebreak) |
+| `author_id` | needed for read-time tombstone filtering |
+| TTL | retention, 800 entries/user |
+
+**Partition by `viewer_id`.** The hot read is "one viewer's page in time order", which is exactly one
+partition, already sorted. This is the whole reason for a materialised timeline. The `author_id`
+copy is deliberate duplication: it lets the read path drop a deleted author's entries without a
+second lookup.
+
+### 6.4 Celebrity list (pull path)
+
+Same shape as 6.3 but **partitioned by `author_id`** and clustered by `(created_at DESC, post_id)`.
+This is where posts from accounts above the 10k threshold live instead of being pushed. Two
+consequences that pay for the hybrid: (a) followers merge these at read; (b) **deleting a celebrity
+account is a single-partition delete**, however many millions of followers it has. Ordinary users
+keep an empty celebrity list.
+
+### 6.5 Follow graph (two adjacency tables)
+
+| Table | Partition key | Clustering key | Serves |
+|-------|---------------|----------------|--------|
+| `follows_by_follower` | `follower_id` | `followee_id` | fanout ("who does X follow"), pull-list build |
+| `follows_by_followee` | `followee_id` | `follower_id` | purge, follower counts, pull-list propagation |
+
+Stored both ways because fanout (needs followers-of-author) and pull-list construction (needs
+followees-of-viewer) are both hot and are opposite directions. A separate counter table keeps
+`follower_count` per account for the push/pull threshold decision. Follow/unfollow writes are
+idempotent upserts/deletes on both tables.
+
+### 6.6 Viewer pull list (projection)
+
+`viewer_id` (partition) → set of `followee_id`s that are above threshold. Maintained on
+follow/unfollow and when an account crosses the threshold. Read on every timeline request so the
+merge knows which celebrity lists to consult; cached in Redis.
+
+### 6.7 Fanout recipients (purge reverse index)
+
+`author_id` (partition), `created_at`, `post_id`, `viewer_id` (clustering). Written by fanout
+workers alongside the timeline entry, TTL-matched to timeline retention. It inverts 6.3 so purge can
+answer "which viewers received author A's post P" without scanning the timeline table. It is the
+one place where the honest cost of the 24h purge guarantee is paid: it roughly doubles fanout write
+volume for ordinary authors (bounded, because ordinary fanout ≤ 10k). See decision record 4.
+
+### 6.8 Media
+
+`media_id` (partition), `owner_id` (indexed), `s3_key`, `content_type`, `size_bytes`, `status`
+(`processing`/`ready`/`blocked`), rendition keys (thumb/medium/full), `width`, `height`,
+`created_at`. S3 is the byte store; this row is metadata and state. Indexed by `owner_id` for purge.
+
+### 6.9 Search document (OpenSearch)
+
+`_id = post_id`; fields `body`, `author_id`, `created_at`, `edited_at`, `revision`. Index sharded by
+`hash(post_id)` for even write distribution; a write alias points at the live index, which allows
+reindex-by-alias without downtime. Recency sort uses `created_at`; relevance ranking is out of scope.
+
+### 6.10 Idempotency and deletion jobs
+
+- `idempotency_keys`: `key` (partition), `user_id`, `post_id`, `request_hash`, TTL 24h. Powers
+  section 5.4.
+- `deletion_jobs`: `deletion_id` (partition), `user_id`, `state`, `progress`, `received_at`,
+  `purge_deadline`. Resumable and idempotent; section 8 and decision record 4.
+
+### 6.11 Relationships
+
+```
+User 1---* Post 1---* PostRevision
+Post *---1 Media
+User *---* User        (follows, via 6.5)
+User 1---1 ViewerPullList
+Post 1---* TimelineEntry *---1 User   (viewer)
+Post 1---* FanoutRecipient
+Post 1---1 SearchDocument
+```

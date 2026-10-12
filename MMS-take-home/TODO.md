@@ -88,4 +88,6 @@ One `post.created` event, two independent idempotent consumers.
 
 **Exit criteria:** diagram and prose describe the same system as §5/§6. Meets the requirements.
 
+
+
 ---
