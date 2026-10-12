@@ -18,6 +18,12 @@ import type {
 
 const DEFAULT_BASE_URL = '/v1'
 
+/** `VITE_API_BASE` overrides the base URL (e.g. a deployed API); otherwise `/v1` is proxied. */
+function readEnvBaseUrl(): string | undefined {
+  const value = import.meta.env.VITE_API_BASE
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
 /**
  * Section 5.2: the browser holds the access token in memory only; it is never persisted or put in
  * a URL. Authentication UI is out of scope (SPEC), so a credential is assumed present: a single
@@ -54,7 +60,7 @@ export class ChirpClient {
   private injectFailure = false
 
   constructor(options: ChirpClientOptions = {}) {
-    this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL
+    this.baseUrl = options.baseUrl ?? readEnvBaseUrl() ?? DEFAULT_BASE_URL
     this.getAccessToken = options.getAccessToken ?? (() => inMemoryAccessToken)
   }
 
