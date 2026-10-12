@@ -896,3 +896,27 @@ GC and rendition retention policy rather than horizontal scaling of origin.
 > **What would change my mind:** a measured median image well under 100 KB would make on-the-fly
 > resize viable again. If CDN hit ratio dropped below 90%, I would revisit key strategy and TTLs.
 > Measurement: origin egress GB/s and p95 image time-to-first-byte.
+>
+
+
+## 8. Failure modes and reliability
+
+| Failure | What the user sees | Effect | Recovery |
+|---------|--------------------|--------|----------|
+| Fanout worker dies mid-post | The post is briefly missing from some followers' timelines, then appears | At-least-once: the Kafka offset is not committed until the batch is written, so the event is redelivered | Idempotent upsert on `(viewer_id, post_id)` makes redelivery safe; no user action needed |
+| Search indexer falls behind | A just-published post is not findable for longer than 5 s | Search freshness SLO burn; the rest of the system is unaffected | Alert on consumer lag; scale consumers/partitions; replay from the retained topic offset |
+| Image store unavailable on publish | Text publishes normally; image posts show a placeholder, or are accepted with `media.status = "processing"` | Publish is decoupled from media availability; only the image is late | Publish accepts the reference, rendition/scan retries with backoff; if upload URLs cannot be issued, text-only publish still succeeds |
+| Timeline cache node is lost | Higher latency on timeline reads; possible brief errors for cache-miss users | Hit ratio drops; Post/Timeline Stores absorb direct reads | Cluster replicates/shard-replicates the key space; survivors serve; request coalescing limits the stampede; cache warms from the store |
+| Primary datastore fails over | Brief write errors (`503`), stale reads for seconds | In-flight writes fail; reads continue from replicas | Client retries with the same idempotency key; failover to a synchronous standby; stated RPO is near-zero for the Post Store |
+| Purge job fails halfway | No visible effect — content was hidden in phase 0 | Physical purge stalls | Jobs are checkpointed and idempotent; resume from checkpoint; read-time tombstones keep content hidden while it retries, within the 24 h budget |
+
+**Consistency model, per read path:**
+
+| Read path | Consistency | Accepted staleness |
+|-----------|-------------|--------------------|
+| Home timeline (others' posts) | Eventual | Seconds (fanout + cache TTL); a follower may briefly not see a post |
+| Own posts in own timeline | Read-your-writes | None — the reader's own posts are merged from the source at read |
+| Single post / edit history | Strong for the author; read-your-writes | Others see the new revision within the cache-invalidation window (< TTL, ~seconds) |
+| Search | Eventual | ≤ 5 s (SLO) |
+| Deletion visibility | Immediate (logical tombstone) | Physical purge ≤ 24 h |
+| Pull (celebrity) merge | Eventual | One timeline refresh; a celebrity post may miss the current page and appear on refresh |

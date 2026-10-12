@@ -121,4 +121,20 @@ One `post.created` event, two independent idempotent consumers.
 
 **Exit criteria:** five records in the exact template, each citing a number. Met (§11) requirements.
 
+## Phase 7 — Cross-cutting non-functionals
+
+**Goal:** name what breaks, what fails, what is exposed.
+
+- **7.1** Bottleneck order: (1) fanout write path >100k/s, (2) read/cache/hydration, (3) search lag.
+- **7.2** Failure table (six required cases) with user effect + recovery.
+- **7.3** Consistency per read path with explicit staleness windows.
+- **7.4** Security: auth, authZ, rate limits, image handling, escaping, deletion scope, transport.
+- **7.5** Deploy + observability: canary/feature flags, metrics, paging alerts, traces, SLOs.
+
+**Decision D7 — timeline read SLO p99 < 200 ms, search freshness p99 ≤ 5 s, purge ≤ 24 h.**
+- *Trade-off:* the read SLO is aggressive; it is the single constraint that justifies the Redis
+  post cache and request coalescing.
+
+**Exit criteria:** SLOs named; every required failure has a recovery. Met.
+
 ---

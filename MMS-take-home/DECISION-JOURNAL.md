@@ -69,6 +69,9 @@ The discipline that mattered: each "numbers that forced it" had to cite a specif
 record scores zero. For DR-2 the forcing case is the worked-trace author — a 3M-follower edit would
 be 3M rewrites if the body were denormalised.
 
+**Phase 7 — Non-functionals. Saturday, about 22:21.** Bottlenecks in saturation order (fanout
+>100k/s, then read/cache, then search lag), the six failure cases with the user-visible effect,
+consistency per read path, security, and SLOs (timeline p99 < 200 ms, search <= 5 s, purge <= 24 h).
 
 ---
 
