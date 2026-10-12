@@ -282,3 +282,43 @@ graph LR
   Purge --> Redis
   Purge --> S3
 ```
+
+### Write path
+
+1. Client requests a presigned URL from **Media Service** if the post carries an image, and `PUT`s
+   the bytes directly to **S3**. The API tier never proxies image bytes.
+2. Client calls `POST /posts` through the **API Gateway**, which authenticates at the edge and
+   forwards to **Publish Service**.
+3. Publish Service allocates a Snowflake `post_id` from **ID Service**, writes the post row and
+   `revision 1` to **Post + Revision Store**, and records the idempotency key. This is the only
+   synchronous durable write on the publish path.
+4. Publish Service appends one `post.created` event to the Kafka **posts topic** and returns `201`
+   with the `Post`. The event, not the response, is what drives fanout and indexing.
+5. **Fanout Service** consumes the topic. It reads the author's follower count from **Follow Graph
+   Store**:
+   - **ordinary author (≤ 10,000 followers):** it expands the post to follower ids and hands
+     batched inserts to **Fanout Workers**, which append `(viewer_id, created_at, post_id,
+     author_id)` rows to the **Timeline Store** and refresh the corresponding **Redis** timeline
+     caches.
+   - **celebrity author (> 10,000 followers):** it does **no** per-follower write. It appends the
+     post to the author's **celebrity list** in Redis and in the Timeline Store under an author key.
+     Followers merge these at read time.
+6. **Search Indexer** consumes the same topic and upserts the document into **OpenSearch**. One
+   topic, two independent consumers, both idempotent.
+
+### Read path (home timeline)
+
+1. Client calls `GET /timelines/home` via the Gateway → **Timeline Service**.
+2. Timeline Service fetches the viewer's materialised entries: **Redis** on hit, **Timeline Store**
+   on miss (which also repopulates the cache).
+3. It fetches the viewer's **pull list** — the celebrities this viewer follows — from a cached
+   per-viewer follow-graph projection.
+4. It merges the pushed entries with the celebrities' recent posts, both keyed by
+   `(created_at, post_id)` and bounded by the requested cursor, to a single ordered page.
+5. It hydrates the `post_id`s to `Post` objects with a batched multiget against the **Redis** post
+   cache, falling through to **Post + Revision Store**. Tombstoned/deleted ids are dropped here.
+6. It returns `{ items, next_cursor }` matching section 5.
+
+The edit and delete paths and the purge are described in decision records 2 and 4 and traced in
+section 12.
+
