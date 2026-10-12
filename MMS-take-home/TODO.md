@@ -137,4 +137,20 @@ One `post.created` event, two independent idempotent consumers.
 
 **Exit criteria:** SLOs named; every required failure has a recovery. Met.
 
+## Phase 8 — Worked trace (heavily weighted)
+
+**Goal:** reconcile the trace with §4, §5 and §6 — the most common place to lose marks.
+
+- **8.1** Cast, clock, fixed ids; cursor token computed with a script and verified to decode.
+- **8.2** Publish → page 1 → edit at T0+10m → page 2 at T0+10m30s → refresh at T0+11m.
+- **8.3** Per-component state after each step; real request/response payloads.
+- **8.4** Conclusion: follower sees the post **once, possibly a stale revision — never twice, never zero**.
+- **8.5** Every inconsistency named with its duration.
+
+**Decision D8 — the celebrity is pulled, so the edit touches no timeline rows.**
+- *Trade-off:* deliberately exercises the hybrid; would be a very different (and expensive) trace
+  under denormalised push.
+
+**Exit criteria:** no disagreement between trace, diagram, contract and data model. Met the requirements
+
 ---

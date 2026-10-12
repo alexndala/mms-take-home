@@ -920,3 +920,186 @@ GC and rendition retention policy rather than horizontal scaling of origin.
 | Search | Eventual | ≤ 5 s (SLO) |
 | Deletion visibility | Immediate (logical tombstone) | Physical purge ≤ 24 h |
 | Pull (celebrity) merge | Eventual | One timeline refresh; a celebrity post may miss the current page and appear on refresh |
+
+
+## 9. Worked trace
+
+**Scenario:** an author with 3,000,000 followers edits a post 10 minutes after publishing, while
+one of its followers is part way through paginating their home timeline.
+
+### Cast, clock and fixed identifiers
+
+| Name | Value |
+|------|-------|
+| Author (celebrity) | `u_01JNOVA000000000000000001`, handle `nova`, **3,000,000 followers** (> 10,000 threshold → pulled) |
+| Follower | `u_01JKAI000000000000000002`, handle `kai`; follows `nova` among ~200 accounts |
+| Post | `p_01JPC00000000000000000001` |
+| Revisions | `1` at publish, `2` after the edit |
+| Publish idempotency key | `idem_9c1f0a7e-2b6d-4c11-9f3a-0f2e7a1c4b55` |
+| `T0` publish | `2026-10-10T21:00:00Z` (`1791666000000` ms) |
+| Edit deadline | `2026-10-10T21:15:00Z` (`T0 + 15 min`) |
+| `T0+9m` page 1 | `2026-10-10T21:09:00Z` |
+| `T0+10m` edit | `2026-10-10T21:10:00Z` |
+| `T0+10m30s` page 2 | `2026-10-10T21:10:30Z` |
+| `T0+11m` refresh | `2026-10-10T21:11:00Z` |
+| Cursor `C1` | `MTc5MTY2NjAwMDAwMDpwXzAxSlBDMDAwMDAwMDAwMDAwMDAwMDAwMDE` = base64url(`1791666000000:p_01JPC00000000000000000001`) |
+
+`nova` is above the 10k push/pull threshold, so `p_01JPC…001` is **never fanned out** to any of the
+3M followers. It lives under `nova`'s author-partitioned celebrity list (section 6.4) and is merged
+into a follower's page at read. This is the whole reason the edit below is cheap.
+
+### Step 1 — `nova` publishes (T0)
+
+```http
+POST /posts HTTP/1.1
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs…       # sub = u_01JNOVA000000000000000001
+Idempotency-Key: idem_9c1f0a7e-2b6d-4c11-9f3a-0f2e7a1c4b55
+Content-Type: application/json
+
+{ "body": "morning all - shipping day", "media_id": null }
+```
+
+```http
+HTTP/1.1 201 Created
+{
+  "post_id": "p_01JPC00000000000000000001",
+  "author": { "user_id": "u_01JNOVA000000000000000001", "handle": "nova",
+              "display_name": "Nova", "avatar_url": "https://cdn.chirp.example/avatars/…" },
+  "body": "morning all - shipping day",
+  "created_at": "2026-10-10T21:00:00Z",
+  "edited": false, "edited_at": null, "revision": 1, "media": null,
+  "permalink": "https://chirp.example/p/p_01JPC00000000000000000001"
+}
+```
+
+State after step 1:
+
+| Component | State |
+|-----------|-------|
+| ID Service | issued `p_01JPC…001` (time-ordered) |
+| Post + Revision Store | post row `p_01JPC…001` (body v1, revision 1); revision row `(p_01JPC…001, 1)` |
+| Idempotency store | `idem_9c1f… → p_01JPC…001`, TTL 24h |
+| Kafka `posts` | one `post.created` event (offset o) |
+| Fanout Service | consumed event; `follower_count(nova)=3,000,000 > 10,000` → **no expansion** |
+| Celebrity list (Redis + store) | appended `(nova, 21:00:00Z, p_01JPC…001)` |
+| Timeline Store (push) | unchanged — no `viewer_id` rows written |
+| Search | not yet indexed (step 2) |
+
+### Step 2 — search becomes fresh (≤ 21:00:05)
+
+The Search Indexer consumes the same event in the next ≤500 ms micro-batch and upserts the document
+`_id = p_01JPC…001`. `publish_to_searchable` ≈ 0.5 s, inside the 5 s SLO.
+
+### Step 3 — `kai` reads page 1 (T0+9m = 21:09:00)
+
+```http
+GET /timelines/home?limit=20 HTTP/1.1
+Authorization: Bearer eyJ…                        # sub = u_01JKAI000000000000000002
+```
+
+```http
+HTTP/1.1 200 OK
+{
+  "items": [ /* 19 pushed posts from ordinary followees… */ ,
+    { "post_id": "p_01JPC00000000000000000001", "author": { "handle": "nova", … },
+      "body": "morning all - shipping day", "created_at": "2026-10-10T21:00:00Z",
+      "edited": false, "edited_at": null, "revision": 1, "media": null, … } ],
+  "next_cursor": "MTc5MTY2NjAwMDAwMDpwXzAxSlBDMDAwMDAwMDAwMDAwMDAwMDAwMDE",
+  "generated_at": "2026-10-10T21:09:00Z"
+}
+```
+
+`p_01JPC…001` is the **20th and last** item, so `next_cursor` (`C1`) decodes to that post's key. The
+page was assembled by: reading `kai`'s pushed entries (Redis/Timeline Store), reading `kai`'s pull
+list (includes `nova`), merging `nova`'s celebrity list into the cursor window, then hydrating ids
+against the Redis post cache → Post Store. At this instant `kai`'s client renders **revision 1,
+`edited:false`**.
+
+### Step 4 — `nova` edits inside the window (T0+10m = 21:10:00)
+
+```http
+PATCH /posts/p_01JPC00000000000000000001 HTTP/1.1
+Authorization: Bearer eyJ…                        # sub = u_01JNOVA000000000000000001
+If-Match: 1
+Content-Type: application/json
+
+{ "body": "morning all - shipping day (v2)" }
+```
+
+```http
+HTTP/1.1 200 OK
+{ "post_id": "p_01JPC00000000000000000001", …,
+  "body": "morning all - shipping day (v2)",
+  "edited": true, "edited_at": "2026-10-10T21:10:00Z", "revision": 2, … }
+```
+
+The authorisation check passes (`sub == author_id`, `21:10:00 ≤ 21:15:00`). State changes:
+
+| Component | State after step 4 |
+|-----------|--------------------|
+| Post + Revision Store | post row now body v2 / revision 2 / `edited_at=21:10:00Z`; append revision row `(p_01JPC…001, 2)` |
+| Post cache (Redis) | key `p_01JPC…001` **invalidated** |
+| Celebrity list | **unchanged** — it stores `(author, created_at, post_id)`, not content, so an edit does not touch it |
+| Timeline Store (push) | **unchanged** — no rows to rewrite (the id-based model, decision record 2) |
+| Kafka `posts` | one `post.updated` event |
+| Search | step 5 |
+
+### Step 5 — search reflects the edit (≤ 21:10:05)
+
+The Search Indexer upserts the same `_id` with body v2 and `revision: 2`. Between step 4 and this
+point (≤ 5 s) search returns v1 for a query that matches it — the first named inconsistency below.
+
+### Step 6 — `kai` requests page 2 (T0+10m30s = 21:10:30)
+
+```http
+GET /timelines/home?limit=20&cursor=MTc5MTY2NjAwMDAwMDpwXzAxSlBDMDAwMDAwMDAwMDAwMDAwMDAwMDE
+Authorization: Bearer eyJ…
+```
+
+```http
+HTTP/1.1 200 OK
+{
+  "items": [ /* 20 pushed posts strictly older than C1; none is p_01JPC…001 */ ],
+  "next_cursor": "MTc5MTY2NTk0MDAwMDpwXzAxSlBDMDAwMDAwMDAwMDAwMDAwMDAwMDk",
+  "generated_at": "2026-10-10T21:10:30Z"
+}
+```
+
+Because `C1` is a strict keyset watermark, the merge for page 2 includes only items **older** than
+`p_01JPC…001`. The edited post is not re-emitted. Had any item in this page been `p_01JPC…001`'s
+newer sibling still unread, it would hydrate from the store as **revision 2** — hydration always
+reads the latest revision.
+
+### Step 7 — `kai` refreshes from the head (T0+11m = 21:11:00)
+
+```http
+GET /timelines/home?limit=20
+```
+The head request returns `p_01JPC…001` with **`revision: 2`, `edited: true`,
+`edited_at: 21:10:00Z`**, and the client now renders the edited indicator.
+
+### What the paginating follower sees
+
+- **Not zero times.** The post was on page 1 at 21:09 and `kai` saw it.
+- **Not twice.** The keyset cursor is a strict watermark; page 2 excludes `p_01JPC…001`, so it cannot
+  reappear. No duplicate.
+- **Exactly once, in one version at a time — but potentially a *stale* version.** `kai`'s rendered
+  page 1 shows **revision 1** while the source is already revision 2. The client holds a stale
+  revision until the next head fetch (step 7). It cannot see two versions *simultaneously in one
+  pagination sequence*; it can see v1, then later v2, across a refresh. The edited indicator is
+  likewise stale on the old page.
+
+### Every inconsistency, and for how long
+
+| # | Inconsistency | Between | Window |
+|---|---------------|---------|--------|
+| 1 | Post Store vs Redis post cache | step 4 write and cache invalidation | sub-second in-line; if invalidation is lost, bounded by the post-cache TTL (~seconds) |
+| 2 | Search index vs Post Store | step 4 and step 5 | ≤ 5 s (indexer micro-batch; the SLO) |
+| 3 | `kai`'s rendered page vs source | step 4 and step 7 (refresh) | until the client fetches the head; ~60 s in this trace, unbounded if the client never refreshes |
+| 4 | Pull-list pointer vs post content | — | none: the celebrity list stores keys, not content, so there is nothing to reconcile |
+| 5 | Search result body vs current body after an edit | step 4 and step 5 | ≤ 5 s, same as #2 |
+
+The design's guarantee is: **within one cursor-pinned pagination sequence, no post is duplicated or
+skipped; across a refresh, the newest revision is served.** The residual risk is client-side staleness
+of an already-rendered page, which is inherent to caching and is bounded by refresh cadence, not by
+the backend.

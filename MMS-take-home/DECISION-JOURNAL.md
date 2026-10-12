@@ -64,14 +64,20 @@ mind:** I first tried to make purge scan the timeline table; at ~16B steady-stat
 partitions that is unscannable. The reverse index roughly **doubles ordinary fanout writes**;
 accepted as the price of a real 24h purge.
 
-**Phase 6 — Decision records. Saturday, about 21:37.** Wrote the five records in the exact template.
+**Phase 6 — Decision records. Sunday, about 21:37.** Wrote the five records in the exact template.
 The discipline that mattered: each "numbers that forced it" had to cite a specific figure, or the
 record scores zero. For DR-2 the forcing case is the worked-trace author — a 3M-follower edit would
 be 3M rewrites if the body were denormalised.
 
-**Phase 7 — Non-functionals. Saturday, about 22:21.** Bottlenecks in saturation order (fanout
+**Phase 7 — Non-functionals. Sunday, about 22:21.** Bottlenecks in saturation order (fanout
 >100k/s, then read/cache, then search lag), the six failure cases with the user-visible effect,
 consistency per read path, security, and SLOs (timeline p99 < 200 ms, search <= 5 s, purge <= 24 h).
+
+**Phase 8 — Worked trace. Sunday, about 23:14.** Traced the 3M-follower edit during pagination.
+**Dead end:** my first draft used a pushed, denormalised author and the trace collapsed into
+"rewrite 3M rows", which is not the design; rewrote it around a **pulled** celebrity where the edit
+touches zero timeline rows. Computed the cursor token with a script so it actually decodes to the
+stated key. Conclusion: the follower sees the post **once, possibly stale — never twice, never zero.**
 
 ---
 
