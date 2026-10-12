@@ -71,4 +71,21 @@ New posts shift offsets, so offset pagination duplicates and skips items mid-scr
 
 **Exit criteria:** the contract is complete enough to hand to the frontend without further design. Met the requirements.
 
+
+## Phase 4 — Architecture, diagram, components
+
+**Goal:** one diagram that agrees with the prose, the contract and the data model.
+
+- **4.1** Mermaid component diagram (client → gateway → services → stores).
+- **4.2** Write path prose (media → publish → Kafka → fanout/indexer).
+- **4.3** Read path prose (cache → store → pull merge → hydration).
+- **4.4** One subsection per component: responsibility, state, scaling, failure behaviour.
+
+**Decision D4 — event-driven fanout off a Kafka topic, shared with the search indexer.**
+One `post.created` event, two independent idempotent consumers.
+- *Trade-off:* eventual consistency and a new failure mode (consumer lag) in exchange for
+  decoupling publish latency from fanout and indexing.
+
+**Exit criteria:** diagram and prose describe the same system as §5/§6. Meets the requirements.
+
 ---

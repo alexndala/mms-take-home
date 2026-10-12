@@ -42,7 +42,7 @@ Fill this in at the end. Wall-clock hours, honestly.
 
 **Phase 2 — Capacity. Saturday, about 10:30.** Worked writes (`579/s`, peak `1,737/s`) and fanout
 (`29k/s`, `87k/s`), then the skew burst (one post `>=1M` writes, `231k-579k/s`). **Change of mind:**
-I first wrote a single read:write ratio of ~100:1 out of habit; a page read hydrates 20 posts, so
+I first wrote a single read:write ratio of ~100:1 out of 'acceptability/ standard' reasons; a page read hydrates 20 posts, so
 the request ratio hides a ~20x larger content load that actually drives CDN cost. Split into
 **~10:1 requests / ~160:1 content**, each cross-checked against per-user behaviour.
 
@@ -51,11 +51,11 @@ schemas, because the frontend compiles against these. Chose a **keyset cursor** 
 `Idempotency-Key` on publish and `If-Match: revision` on edit. **Dead end:** I sketched offset paging
 first because it is less code; abandoned it once I traced what a post landing mid-scroll does.
 
-
-**Phase 4 — Architecture and components. Sunday, about 13:00.** Drew the diagram only after the
+**Phase 4 — Architecture and components. Saturday, about 13:00.** Drew the diagram only after the
 arithmetic settled DR-1. Event-driven fanout off a Kafka topic, shared with the search indexer (one
 event, two idempotent consumers). Moderation hook between ingest and fanout so a verdict can
 suppress fanout without changing the API.
+
 
 ---
 
