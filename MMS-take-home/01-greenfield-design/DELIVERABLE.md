@@ -756,3 +756,143 @@ reindex traffic from live traffic so a rebuild cannot starve freshness.
 **Slower break: media storage and egress.** Growth from `17.1 TB/day` ingress and `~440 TB/day`
 egress is a cost and capacity curve, not a latency cliff; it is managed with CDN hit ratio, lifecycle
 GC and rendition retention policy rather than horizontal scaling of origin.
+
+
+## Decision records
+
+### Decision record 1 — Fanout strategy
+
+> **Decision:** Hybrid. Write-time push for authors at or below **10,000 followers**; read-time
+> pull/merge for authors above it. The threshold is a tunable, not a constant.
+>
+> **Alternative rejected:** Pure write-time fanout ("fanout-on-write") for every post. It is the
+> simplest timeline read and I rejected it on arithmetic, not taste. Also considered, and rejected
+> for the opposite reason, was pure read-time merge for everyone.
+>
+> **The numbers that forced it:** the average path is cheap — `579 posts/s × 50 = 28,935 writes/s`
+> average, `~87k/s` peak, which one ScyllaDB cluster absorbs. The skew path is not. `20,000,000 ×
+> 0.001 = 20,000` accounts at `≥1,000,000` followers each is a floor of `20,000,000,000` timeline
+> writes/day, versus the `50,000,000 × 50 = 2.5B/day` the average implies — **8× the entire average
+> path from 0.04% of posts**, rising to `578,704/s` at the pack's implied 2.5 posts/user/day. A
+> single celebrity post is `≥1,000,000` writes in one burst. The 10k threshold caps any single
+> pushed post at 10,000 writes, which a Kafka-buffered writer pool can drain.
+>
+> **What this costs:** two permanent code paths (push writer + read-side merge); the merged read is
+> more complex and slightly slower; a per-viewer pull list must be maintained as accounts cross the
+> threshold; and the threshold itself is a guess that can be wrong for a rising account.
+>
+> **What would change my mind:** a measured real post-fanout distribution whose 99.9th percentile is
+> below ~5,000 would let me drop the hybrid for pure push and delete the merge path. Conversely, if
+> merged-read p99 exceeds 300 ms or the pull list costs more than the fanout it saves, I raise the
+> threshold. Specific test: replay one day of posts, measure merged-read p99 and fanout write
+> throughput at 2× peak.
+
+### Decision record 2 — Edit propagation
+
+> **Decision:** Timelines store **identifiers** `(post_id, author_id, created_at)`, never post
+> content. An edit updates `Post.body/revision/edited_at`, appends a `PostRevision` snapshot,
+> invalidates the Redis post-cache key, and emits a search-update event. **Nothing in the timeline
+> store is rewritten.**
+>
+> **Alternative rejected:** Denormalising the body into timeline entries for a cheaper read
+> (the classic fanout-of-content timeline). It makes reads marginally faster and makes edits
+> catastrophic.
+>
+> **The numbers that forced it:** the edit window is 15 minutes and the worked-trace author has
+> **3,000,000 followers**. With denormalised content, that single edit is up to 3M entry rewrites
+> (and under hybrid it is a pulled author, so those entries would not even be individually
+> addressable). Even the ordinary case: `50M × 5% = 2.5M` edits/day × 50 fanout = `125M` rewrites/
+> day, pure write amplification for no read benefit. The id-based model makes an edit **O(1)** — one
+> row, one cache invalidation — and hydration reads the latest revision by construction. Section 2.5
+> shows revision history is ~45 GB/month, so storing full snapshots rather than deltas costs nothing
+> meaningful.
+>
+> **What this costs:** read amplification — a page of 20 posts is 20 hydration lookups, which is why
+> the Redis post cache and batched multiget exist; a dependency on cache invalidation reliability; a
+> short staleness window while invalidation propagates; and **version skew**, where a reader mid-scroll
+> can see an older revision of a post than a fresh reader (traced in section 12).
+>
+> **What would change my mind:** if post-cache hit ratio fell below ~90% and hydration p99 exceeded
+> ~150 ms under load, I would keep a short-TTL denormalised copy in the timeline entry with
+> asynchronous repair, accepting a bounded staleness to cut round trips. Measurement: post-cache hit
+> ratio and hydrated-page p99.
+
+### Decision record 3 — Search freshness
+
+> **Decision:** Asynchronous indexing off the **same Kafka `posts` topic** the fanout service uses.
+> The indexer consumes in micro-batches (≤ 500 ms), bulk-upserts into OpenSearch, and targets
+> **p99 ≤ 5 s** from publish to searchable.
+>
+> **Alternative rejected:** Synchronous dual-write — index the document inside the `POST /posts`
+> request before returning. It couples search availability to publish latency and to the OpenSearch
+> cluster, exactly the coupling the prompt's scope warns against.
+>
+> **The numbers that forced it:** ingest is `579 docs/s` average and `1,737/s` at 3× peak. A 500 ms
+> micro-batch means ~2 batches/s at average load and still ≤ 1 batch/s at peak, so the pipeline has
+> roughly **9× margin** against the 5 s SLO before consumer lag even matters. OpenSearch's 1 s
+> default refresh plus a sub-second batch keeps publish→searchable well under 5 s. The constraint is
+> the SLO, not the throughput, so the queue is the right place for the latency budget.
+>
+> **What this costs:** search is eventually consistent — a post (or edit, or deletion) can be absent
+> or stale in results for up to ~5 s; the index is not the source of truth; ordering of edits and
+> deletes must be handled by revision/tombstone, and indexer lag is a new failure mode (section 8).
+>
+> **What would change my mind:** if indexer lag p99 exceeded 3 s under sustained 2× peak (e.g., a
+> bulk reindex competing with live traffic), I would dedicate partitions/consumers to the live topic
+> and isolate reindex traffic. Measurement: `publish_to_searchable_seconds` p99 and consumer-group lag.
+
+### Decision record 4 — Deletion purge
+
+> **Decision:** Two-phase. **Phase 0 (immediate):** mark the account deleted and tombstone its
+> posts; every read path filters tombstoned authors, so content is unreadable at once. **Phase 1
+> (asynchronous, resumable):** physically purge posts, revisions, timeline entries, search docs,
+> cache keys and S3 objects, within **24 h**, using the `fanout_recipients` reverse index (section
+> 6.7) for ordinary authors and a single-partition delete for celebrity authors.
+>
+> **Alternative rejected:** Synchronous scatter-delete — block the `DELETE /accounts/me` request
+> while every timeline entry is removed. It cannot meet any latency budget and cannot survive a
+> partial failure. Also rejected: read-filter only, never physical — it fails the word "purges" and
+> leaves PII resident.
+>
+> **The numbers that forced it:** the budget is **24 h**; deletions are assumed at `100,000/month ≈
+> 3,333/day`. An ordinary author has fanout ≤ the **10,000** push threshold, so the reverse index
+> targets at most 10k entries per post instead of scanning the **16B-entry** steady-state timeline
+> table, which is unscannable. A celebrity's posts live in an **author-partitioned** list, so purging
+> a 1M-plus-follower account is one partition delete, not 1M row deletes. Paying for this: the
+> reverse index roughly **doubles** ordinary fanout writes (`~29k/s → ~58k/s`).
+>
+> **What this costs:** tombstones live up to 24 h; the reverse index doubles ordinary fanout write
+> volume and adds storage; the purge job is stateful and must be resumable; S3 objects, CDN caches
+> and **backups** hold the data longest, so a truly complete purge is bounded by backup rotation,
+> which I state rather than hide (section 9).
+>
+> **What would change my mind:** if the fanout write budget could not absorb the ~2× cost of the
+> reverse index, I would fall back to read-filter + retention-TTL eviction and renegotiate what
+> "purge" means. Measurement: purge completion p99 must stay under 24 h with a target of 12 h; a load
+> test at 5B affected entries exposes it.
+
+### Decision record 5 — Image handling
+
+> **Decision:** Two-step **presigned direct-to-S3 upload** (`POST /media` → client `PUT` → `POST
+> /media/{id}/complete`), asynchronous validation/scan/re-encode with EXIF stripped, three
+> precomputed renditions (thumb/medium/full), delivery via CDN with **content-addressed, immutable**
+> rendition keys and long edge TTLs, lifecycle GC and deletion propagation.
+>
+> **Alternative rejected:** Proxy the bytes through the API tier and resize on the fly per request.
+> It removes the async processing state but puts resize compute and all image egress on the origin.
+>
+> **The numbers that forced it:** media ingress is `17.1 TB/day` and feed egress is `5,671 pages/s
+> × 6 images × 150 KB ≈ 5.1 GB/s = ~440 TB/day`, `15.3 GB/s` at peak. Origin cannot serve 440 TB/day
+> at any sane cost; a CDN at a 95% edge hit ratio drops origin to `~0.26 GB/s`. On-the-fly resize
+> defeats that: every size variant becomes a distinct origin miss. Content-addressed immutable
+> renditions are what make a 95%+ hit ratio achievable. The 2 MB cap and content-type allowlist are
+> enforced at URL issuance, before any bytes reach storage.
+>
+> **What this costs:** a processing window where `media.status = "processing"` and a post can be live
+> before its image is ready; rendition storage of ~175 TB/month on top of originals; and deletion is
+> harder because CDN edges and immutable objects must be invalidated or aged out (resolved with
+> content-addressed keys plus a mutable pointer row that deletion can flip).
+>
+> **What would change my mind:** a measured median image well under 100 KB would make on-the-fly
+> resize viable again. If CDN hit ratio dropped below 90%, I would revisit key strategy and TTLs.
+> Measurement: origin egress GB/s and p95 image time-to-first-byte.
