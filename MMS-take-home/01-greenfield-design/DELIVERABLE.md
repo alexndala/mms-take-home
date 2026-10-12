@@ -322,3 +322,67 @@ graph LR
 The edit and delete paths and the purge are described in decision records 2 and 4 and traced in
 section 12.
 
+## 4. Core components
+
+Each entry: responsibility, what it stores/caches, how it scales, behaviour when unavailable.
+
+**API Gateway + Load Balancer.** Terminates TLS, validates the JWT at the edge (signature + `jti`
+denylist check), enforces coarse per-`sub`/per-IP rate limits, routes to services. Scales
+horizontally, stateless. Unavailable: total outage at the edge; mitigated by anycast and N+2
+replicas across zones.
+
+**Auth Service.** Issues and rotates tokens, owns login and refresh. Stores refresh families
+(hashed) in its own relational store and the access-token denylist in Redis. Scales horizontally.
+Unavailable: existing access tokens keep working for up to 15 minutes; no new logins or refreshes,
+which is a degraded-but-usable state.
+
+**Publish Service.** Validates the write, allocates ids, persists the post + first revision,
+records idempotency, emits the Kafka event. Stores nothing hot itself. Scales horizontally on the
+write rate (579/s avg, 1,737/s peak). Unavailable: publishes fail with `503`; the client retries
+with the same idempotency key, so no duplicate on recovery.
+
+**ID Service (Snowflake).** Hands out time-ordered 64-bit ids (`post_id`, etc.). Because ids are
+time-ordered, `post_id` is a usable tiebreaker and range cursor. Scales as a partitioned sequence
+allocator; workers lease id ranges so a single unavailable node does not stop allocation.
+
+**Post + Revision Store.** System of record for post bodies and full revision snapshots.
+Wide-column, partitioned by `post_id`, with an `author_id` secondary index for purge and profile
+reads. Written at 579/s, read at the content rate via cache. Unavailable: writes fail; reads are
+served from the Redis post cache for hot posts and fail otherwise. Failover in section 8.
+
+**Timeline Store (ScyllaDB).** Materialised push timelines, partitioned by `viewer_id`, clustered by
+`(created_at DESC, post_id)`. Written at up to ~29k/s average and ~87k/s peak (fanout). Scales by
+adding nodes; partitioning spreads viewers evenly. Retention 800 entries/reader keeps it at ~1 TB
+steady state. Unavailable: timeline reads for cache-miss users fail or return stale cache; section 8.
+
+**Fanout Service + Workers.** Consume `post.created`, decide push vs pull, expand followers, batch
+writes. Scale as independent consumer-group members; the queue absorbs bursts, which is what makes
+the celebrity case survivable. Workers are idempotent (upsert on `(viewer_id, post_id)`). Worker
+death mid-post: the Kafka offset is not committed, so the event is redelivered; see section 8.
+
+**Redis (timeline + post + celebrity cache).** Three logical caches: recent timeline pages per
+viewer (short TTL), post objects by `post_id` (TTL, invalidated on edit), and per-author celebrity
+lists. Scales by sharding on key. Unavailable: hit rate collapses to the Timeline Store and Post
+Store; request coalescing prevents a stampede; latency rises but the system stays up.
+
+**Follow Graph Store.** Adjacency in both directions (`follows_by_follower`, `follows_by_followee`).
+The follower→followee direction feeds fanout; the followee→follower direction feeds pull-list
+construction and purge. Partitioned by the leading id. Unavailable: fanout pauses (queue buffers)
+and pull-list construction degrades; see section 8.
+
+**Media Service + S3 + CDN.** Issues presigned uploads, validates content type/size, runs
+scan + re-encode + rendition generation asynchronously, stores originals and renditions in S3, serves
+via CDN. Scales as a stateless service; S3/CDN scale inherently. Media Service unavailable: uploads
+fail but text-only publishes proceed. S3 unavailable on publish: publish is accepted with
+`media.status = "processing"` and the rendition completes on retry (section 8).
+
+**Search Service + Indexer + OpenSearch.** The Indexer consumes the same `posts` topic; Search
+Service serves queries. Documents keyed by `post_id`, indexed on body with `created_at` for recency sort.
+Scales by index sharding and consumer count. Indexer behind: search freshness breaches SLO but the
+rest of the system is unaffected; lag is the alert (section 10).
+
+**Purge Service.** Executes account deletion: logically via tombstones first (immediate read-time
+hiding) then physically purges Timeline Store entries, posts, revisions, search docs, caches and S3
+objects within 24h. Scales by sharding deletion jobs. Unavailable/failed halfway: jobs are
+resumable and idempotent; read-time filtering already hides the content, so the deadline is the only
+residual risk.
