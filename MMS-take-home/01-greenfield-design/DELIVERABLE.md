@@ -1128,3 +1128,27 @@ the backend.
   expires** — stated explicitly rather than claimed otherwise; account deletion is recorded so a
   restore can re-apply tombstones.
 - **Transport.** TLS 1.2+ everywhere, HSTS, internal service-to-service mTLS.
+
+## 14. Trade-offs and what you would do with more time
+
+**Deliberately traded away:** real-time (strongly consistent) timeline reads — I chose eventual
+consistency for fanout scalability; recommendation and ranking — explicitly out of scope, so the
+timeline is strictly reverse-chronological; multi-region active-active — I designed for a single
+primary region with CDN at the edge, accepting cross-region read latency; rich moderation — only a
+hook, not a pipeline; and per-post analytics — not designed.
+
+**What I would build next, in order, and why that order:**
+
+1. **Replace the guessed fanout threshold with a measured, adaptive one.** It is the highest-risk
+   unvalidated number (critique 1) and everything downstream depends on it. Cheap to build, and it
+   de-risks the write path.
+2. **Prove and, if needed, redesign the purge path.** It carries a hard external promise (24 h) and a
+   hidden cost (2× fanout writes) (critique 2). A load test comes before any new feature.
+3. **Bound the pull/merge worst case** with a per-viewer merge cap or cached materialisation
+   (critique 3), so one heavy follower cannot degrade the read SLO for others.
+4. **Multi-region read replicas and, later, active-active**, once the single-region SLOs are proven.
+5. **A ranking/recommendation layer**, which is out of scope here but is the obvious next product
+   change and would sit behind the timeline service without altering the storage model.
+
+The order is risk-first, not value-first: the first three items above are the only places where I
+have a specific reason to doubt that the stated SLOs hold under the prompt's numbers.
