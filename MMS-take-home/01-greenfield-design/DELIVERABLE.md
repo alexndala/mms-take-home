@@ -1103,3 +1103,28 @@ The design's guarantee is: **within one cursor-pinned pagination sequence, no po
 skipped; across a refresh, the newest revision is served.** The residual risk is client-side staleness
 of an already-rendered page, which is inherent to caching and is bounded by refresh cadence, not by
 the backend.
+
+## 9. Security
+
+- **Authentication and sessions.** OAuth 2.1/OIDC; 15-minute RS256 JWTs validated at the gateway;
+  rotating opaque refresh tokens held server-side; `jti` denylist in Redis for immediate revocation
+  (logout-all, account deletion). No credentials in URLs or cookies for the API.
+- **Authorisation on edit and delete.** Edit requires `sub == post.author_id` **and** the 15-minute
+  window; account deletion is self-only. Both are enforced server-side, never by the client.
+- **Abuse and rate limiting.** Per-`sub` and per-IP token buckets at the gateway, tighter for
+  publish, search and follow; search query length capped; cost-based limits on expensive merges; a
+  moderation hook sits after ingest and before fanout (section 1) so a verdict can suppress fanout
+  without changing the contract.
+- **Image upload.** Content-type allowlist **plus magic-byte sniffing** (never trust the declared
+  type), 2 MB cap enforced at URL issuance, asynchronous malware scan, full re-encode that strips
+  EXIF/GPS and any embedded script, and **no SVG** (it is a script container). User content is served
+  from a distinct origin/domain so it can never share a cookie scope with the app.
+- **Output escaping.** Post bodies are treated as plain text and HTML-escaped on render; a strict
+  Content-Security-Policy and `X-Content-Type-Options: nosniff` are set; URLs in bodies are linkified
+  only after scheme allowlisting.
+- **Personal data and what deletion removes.** Phase 0 removes visibility; phase 1 removes posts,
+  revisions, timeline entries, search documents, cache keys and S3 objects. It also removes the
+  media renditions and invalidates CDN copies. **Backups retain data until their rotation window
+  expires** — stated explicitly rather than claimed otherwise; account deletion is recorded so a
+  restore can re-apply tombstones.
+- **Transport.** TLS 1.2+ everywhere, HSTS, internal service-to-service mTLS.
