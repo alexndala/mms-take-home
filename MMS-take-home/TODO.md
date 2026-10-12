@@ -153,4 +153,18 @@ One `post.created` event, two independent idempotent consumers.
 
 **Exit criteria:** no disagreement between trace, diagram, contract and data model. Met the requirements
 
+## Phase 9 - Self-critique and trade-offs (heavily weighted)
+
+**Goal:** attack the design honestly with measurable falsifiers. 
+
+- **9.1** Weakness 1: the 10k threshold is an unvalidated guess. *Test:* rise 9k→1M followers in 1 h; fail if freshness lag p99 > 30 s.
+- **9.2** Weakness 2: purge unproven at scale / reverse-index cost. *Test:* 100k posts × 10k followers = 1B rows; fail if purge p99 > 12 h.
+- **9.3** Weakness 3: pull/merge worst case per viewer. *Test:* follow 1,000 celebrities at 17k rps; fail if merge p99 > 200 ms.
+- **9.4** Trade-offs and next-work order (risk-first).
+- **9.5** Ranking, notifications, DMs, ads, moderation policy — out of scope per prompt.
+
+**Exit criteria:** three weaknesses, each with a load, a metric and a failure threshold. Not met - time constraint.
+
+
+
 ---
