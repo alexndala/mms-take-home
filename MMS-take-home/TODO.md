@@ -89,5 +89,24 @@ One `post.created` event, two independent idempotent consumers.
 **Exit criteria:** diagram and prose describe the same system as §5/§6. Meets the requirements.
 
 
+## Phase 5 — Data model and sharding
+
+**Goal:** choose keys from access patterns, not normal form.
+
+- **5.1** `Post` partitioned by `post_id` (+ author index).
+- **5.2** `PostRevision` `(post_id, revision)` full snapshots (cheap at 45 GB/mo).
+- **5.3** Timeline partitioned by `viewer_id`, clustered `(created_at, post_id)`.
+- **5.4** **Author-keyed celebrity list** (pull) — makes a celebrity delete a single-partition op.
+- **5.5** Follow graph in **both directions** (fanout needs followers; pull-list/purge need followees).
+- **5.6** `fanout_recipients` reverse index for purge (§6.7).
+- **5.7** Search doc, media, idempotency, deletion-job tables.
+
+**Decision D5 — store `post_id` in timelines, never content.** (See DR-2.)
+- *Trade-off:* read amplification (20 hydrations/page) and a post-cache dependency, in exchange for
+  O(1) edits.
+**Decision D5b — pay ~2× ordinary fanout writes for the reverse index.**
+- *Trade-off:* higher write cost in exchange for a real, bounded 24 h physical purge.
+
+**Exit criteria:** each store's partition key is justified against §5 access patterns. Met the requirements.
 
 ---
