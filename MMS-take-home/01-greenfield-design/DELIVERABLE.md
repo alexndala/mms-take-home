@@ -726,3 +726,33 @@ Post 1---* TimelineEntry *---1 User   (viewer)
 Post 1---* FanoutRecipient
 Post 1---1 SearchDocument
 ```
+
+## 7. Scaling and bottlenecks
+
+Bottlenecks are named in the order they saturate as load grows, with the load figure at which each
+breaks and the response.
+
+**First: the fanout write path (Fanout Workers + Timeline Store).** Provisioned to ~100k writes/s,
+which is only ~15% above the `87k/s` peak from section 2.2 — deliberately the tightest resource,
+because over-provisioning it means over-paying for the most expensive write amplifier. At sustained
+fanout above ~100k/s (roughly 2,000 median-fanout posts/s), Kafka lag grows, the offset of fresh
+timelines slips, and home timelines start missing recent posts. Response: scale the consumer group
+and Scylla nodes linearly (both shard cleanly by `viewer_id`); if the burst is a celebrity event the
+threshold already excludes it, and if it is broad, lower the push threshold to convert more authors
+to pull.
+
+**Second: the timeline read path (Redis + Post Store hydration).** At the `17k/s` peak request rate
+each page triggers ~20 hydration lookups, so the read path depends entirely on the Redis post cache
+(section 6.1). It breaks when a Redis shard saturates or the hit ratio collapses — a cold cache after
+a restart or a celebrity churn event. Effect: multigets fall through to the Post Store, p99 climbs,
+and a thundering herd compounds it. Response: shard Redis on key, batch multigets, add request
+coalescing so one miss per key is fetched, and jitter TTLs.
+
+**Third: search indexing.** Throughput is not the issue (section 2.6, decision record 3); **lag** is.
+At sustained ~2× peak ingest the indexer falls behind and the 5 s freshness SLO is breached.
+Response: add topic partitions and consumer/worker parallelism, increase bulk batch size, and isolate
+reindex traffic from live traffic so a rebuild cannot starve freshness.
+
+**Slower break: media storage and egress.** Growth from `17.1 TB/day` ingress and `~440 TB/day`
+egress is a cost and capacity curve, not a latency cliff; it is managed with CDN hit ratio, lifecycle
+GC and rendition retention policy rather than horizontal scaling of origin.

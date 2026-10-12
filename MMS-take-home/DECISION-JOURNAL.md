@@ -56,13 +56,18 @@ arithmetic settled DR-1. Event-driven fanout off a Kafka topic, shared with the 
 event, two idempotent consumers). Moderation hook between ingest and fanout so a verdict can
 suppress fanout without changing the API.
 
-**Phase 5 — Data model. Sunday, about 14:00.** Chose partition keys from access patterns: `Post`
+**Phase 5 — Data model. Sunday, about 20:00.** Chose partition keys from access patterns: `Post`
 by `post_id`, timeline by `viewer_id`, `PostRevision` by `post_id`. Two non-obvious pieces: an
 **author-keyed celebrity list** (a celebrity delete becomes a single-partition op) and a
 `fanout_recipients` **reverse index** (purge can answer "who received this post"). **Change of
 mind:** I first tried to make purge scan the timeline table; at ~16B steady-state rows across viewer
 partitions that is unscannable. The reverse index roughly **doubles ordinary fanout writes**;
 accepted as the price of a real 24h purge.
+
+**Phase 6 — Decision records. Saturday, about 21:37.** Wrote the five records in the exact template.
+The discipline that mattered: each "numbers that forced it" had to cite a specific figure, or the
+record scores zero. For DR-2 the forcing case is the worked-trace author — a 3M-follower edit would
+be 3M rewrites if the body were denormalised.
 
 
 ---

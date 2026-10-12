@@ -109,4 +109,16 @@ One `post.created` event, two independent idempotent consumers.
 
 **Exit criteria:** each store's partition key is justified against §5 access patterns. Met the requirements.
 
+## Phase 6 — The five decision records (heavily weighted)
+
+**Goal:** each record names the number that forced it, a real alternative, and a falsifier.
+
+- **DR-1 Fanout:** hybrid push/pull at a 10,000 threshold. *Cost:* two code paths, merge latency.
+- **DR-2 Edit propagation:** id-based timelines + cache invalidation + search update. *Cost:* read amplification, version skew.
+- **DR-3 Search freshness:** Kafka log-tail micro-batch, p99 ≤ 5 s. *Cost:* eventual consistency.
+- **DR-4 Deletion purge:** tombstone + resumable physical purge ≤ 24 h via reverse index. *Cost:* ~2× fanout writes, tombstones for up to 24 h.
+- **DR-5 Image handling:** presigned S3 upload + async renditions + CDN. *Cost:* processing window, ~175 TB/mo extra renditions.
+
+**Exit criteria:** five records in the exact template, each citing a number. Met (§11) requirements.
+
 ---
